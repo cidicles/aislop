@@ -1,0 +1,50 @@
+# aislop.cloud: the only hand-written Caddy config.
+#
+# Caddy runs in Docker (container "caddy", --network host) with /srv/aislop mounted read-only
+# at the same path and its certificates in the caddy_data volume. Per-project routes are
+# generated into /srv/aislop/caddy/projects/<slug>.caddy by `aislop rebuild`, which runs on
+# every deploy. Edit this file in C:\sites\aislop\server and push it with `deploy.js --infra`.
+
+# Addresses from before the domain existed, so old links keep working: the IP's root used
+# to be Hard Launch, and MemeBreak lived at /memebreak (the aislop.cloud site handles that).
+(legacy) {
+	redir / https://aislop.cloud/hard-launch/ 308
+	redir https://aislop.cloud{uri} 308
+}
+
+aislop.cloud {
+	encode zstd gzip
+
+	# Media is cached for a day; everything else revalidates via ETag/Last-Modified.
+	# "?" only sets the header when the app (e.g. a docker project) didn't send its own.
+	@media path *.png *.jpg *.jpeg *.webp *.avif *.gif *.svg *.ico *.mp3 *.ogg *.wav *.mp4 *.webm *.woff *.woff2
+	header @media ?Cache-Control "public, max-age=86400"
+	@other not path *.png *.jpg *.jpeg *.webp *.avif *.gif *.svg *.ico *.mp3 *.ogg *.wav *.mp4 *.webm *.woff *.woff2
+	header @other ?Cache-Control "no-cache"
+
+	import /srv/aislop/caddy/projects/*.caddy
+
+	# Anything that isn't a project: the landing page.
+	handle {
+		root * /srv/aislop/www
+		file_server
+	}
+
+	handle_errors 404 {
+		root * /srv/aislop/www
+		rewrite * /404.html
+		file_server
+	}
+}
+
+www.aislop.cloud {
+	redir https://aislop.cloud{uri} 308
+}
+
+167-172-198-106.sslip.io {
+	import legacy
+}
+
+:80 {
+	import legacy
+}

@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""aislop: publish and manage the projects served at https://aislop.cloud/<slug>/
+
+usage:
+  aislop deploy             publish a project bundle (a tar on stdin, built by deploy.js)
+  aislop list               every project with its type, port and status
+  aislop logs <slug> [-f]   docker logs of a docker project
+  aislop up <slug>          rebuild + restart a docker project from its files on disk
+                            (e.g. after editing /srv/aislop/projects/<slug>/.env)
+  aislop remove <slug>      unpublish a project and delete everything it owns
+  aislop rebuild            regenerate the Caddy routes and the landing page's projects.json
+
+A bundle is a tar holding project.json (the manifest), payload/ (a static site, or a docker
+build context) and optionally thumb.<ext>. See C:\\sites\\aislop\\README.md.
+"""
+import datetime
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+ROOT = '/srv/aislop'
+PROJECTS = f'{ROOT}/projects'
+THUMBS = f'{ROOT}/www/thumbs'
+ROUTES = f'{ROOT}/caddy/projects'
+CADDYFILE = f'{ROOT}/caddy/Caddyfile'
+SITE = 'https://aislop.cloud'
+PORTS = range(5200, 5400)
+SLUG = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$')
+RESERVED = {'thumbs', 'api', 'admin', 'www', 'assets', 'static'}
+THUMB_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.avif', '.gif'}
+VOLUME = re.compile(r'^[a-z0-9][a-z0-9._-]*$')   # a project's own data dir, not a host path
+LOCAL_ONLY = ('build', 'dir', 'files', 'thumbnail')  # aislop.json fields only deploy.js uses
+PUBLIC_FIELDS = ('slug', 'name', 'tagline', 'tags', 'created', 'updated', 'thumb', 'models', 'repo')
+
+
+def die(msg):
+    sys.exit(f'aislop: {msg}')
+
+
+def sh(*cmd, check=True):
+    """Run a command with captured output; die with its stderr if it fails and check is set."""
+    r = subprocess.run(cmd, text=True, capture_output=True)
+    if check and r.returncode:
+        die(f'{" ".join(cmd)} failed:\n{(r.stderr or r.stdout).strip()}')
+    return r
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+
+def container(slug):
+    return f'aislop-{slug}'
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_json(path, data):
+    with open(path + '.tmp', 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+    os.replace(path + '.tmp', path)
+
+
+def load_projects():
+    return [read_json(f'{PROJECTS}/{s}/project.json') for s in sorted(os.listdir(PROJECTS))
+            if os.path.isfile(f'{PROJECTS}/{s}/project.json')]
+
+
+def load_project(slug):
+    path = f'{PROJECTS}/{slug}/project.json'
+    if not SLUG.match(slug) or not os.path.isfile(path):
+        die(f'no project called {slug!r} (see `aislop list`)')
+    return read_json(path)
+
+
+def check_manifest(m, others):
+    slug = m.get('slug')
+    if not isinstance(slug, str) or not SLUG.match(slug) or slug in RESERVED:
+        die(f'bad slug {slug!r}: use lowercase letters, digits and dashes, and not {", ".join(sorted(RESERVED))}')
+    if m.get('type') not in ('static', 'docker'):
+        die('type must be "static" or "docker"')
+    if not isinstance(m.get('name'), str) or not m['name'].strip():
+        die('name is required')
+    taken = {n for p in others for n in [p['slug'], *p.get('aliases', [])]}
+    if slug in taken:
+        die(f'{slug!r} is already an alias of another project')
+    for a in m.get('aliases', []):
+        if not isinstance(a, str) or not SLUG.match(a) or a in RESERVED or a == slug:
+            die(f'bad alias {a!r}')
+        if a in taken:
+            die(f'alias {a!r} is already the slug or alias of another project')
+
+
+def replace_dir(src, dst):
+    """Swap src into dst's place with two renames, so a live site is never half-written."""
+    old = dst + '.old'
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.exists(dst):
+        os.rename(dst, old)
+    os.rename(src, dst)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def drop_thumbs(slug):
+    for f in os.listdir(THUMBS):
+        if os.path.splitext(f)[0] == slug:
+            os.remove(f'{THUMBS}/{f}')
+
+
+def pick_port(m, old, projects):
+    """Pinned port from the manifest, else the one this project already has, else the next free one."""
+    taken = {p.get('port') for p in projects if p['slug'] != m['slug']}
+    port = int(m.get('port') or (old or {}).get('port') or 0)
+    if port:
+        if port in taken:
+            die(f'port {port} already belongs to another project')
+        return port
+    for port in PORTS:
+        with socket.socket() as s:
+            if port not in taken and s.connect_ex(('127.0.0.1', port)):
+                return port
+    die('no free ports left')
+
+
+def volumes_for(m):
+    """-v flags for a project's persistent directories, created on demand.
+
+    A deploy replaces app/ and recreates the container, so anything the app
+    wrote inside it is gone. A project that keeps state — accounts, uploads, a
+    database file — needs it to live beside app/ instead, where `replace_dir`
+    never looks.
+
+    The host side is a plain name resolved inside the project's own directory,
+    never a path the manifest chooses. A manifest is uploaded content, and
+    "mount /etc into my container" or "mount another project's data" is not a
+    thing it gets to say.
+    """
+    args, hosts = [], []
+    for spec in m.get('volumes', []):
+        if not isinstance(spec, str) or spec.count(':') != 1:
+            die(f'bad volume {spec!r}: use "name:/path/in/container"')
+        src, dst = spec.split(':')
+        if not VOLUME.match(src):
+            die(f'bad volume name {src!r}: lowercase letters, digits, dot, dash, underscore')
+        if not dst.startswith('/') or '..' in dst.split('/'):
+            die(f'bad volume target {dst!r}: use an absolute path inside the container')
+        host = f'{PROJECTS}/{m["slug"]}/{src}'
+        os.makedirs(host, exist_ok=True)
+        args += ['-v', f'{host}:{dst}']
+        hosts.append(host)
+    return args, hosts
+
+
+def chown_volumes(name, hosts):
+    """Hand the volumes to whoever the image runs as.
+
+    Directories are created here as root, but a well-behaved image drops to an
+    unprivileged user and would then fail to write to its own data directory.
+    Asking the image who it runs as beats hardcoding 1000: it is one throwaway
+    container, and it is right for images that run as root too.
+    """
+    if not hosts:
+        return
+    who = sh('docker', 'run', '--rm', '--entrypoint', 'id', name, '-u', check=False)
+    uid = who.stdout.strip()
+    if not uid.isdigit():
+        print(f'warning: could not tell what user {name} runs as; leaving volumes owned by root',
+              file=sys.stderr)
+        return
+    if uid != '0':
+        sh('chown', '-R', f'{uid}:{uid}', *hosts)
+
+
+def docker_up(m):
+    slug, name, port = m['slug'], container(m['slug']), m['port']
+    print(f'building {name} ...', flush=True)
+    sh('docker', 'build', '-q', '-t', name, f'{PROJECTS}/{slug}/app')
+    mounts, hosts = volumes_for(m)
+    chown_volumes(name, hosts)
+    sh('docker', 'rm', '-f', name, check=False)
+    cmd = ['docker', 'run', '-d', '--name', name, '--restart', 'unless-stopped',
+           '--memory', str(m.get('memory', '256m')), '--label', f'aislop.slug={slug}',
+           '-p', f'127.0.0.1:{port}:{m.get("containerPort", 8080)}'] + mounts
+    env = f'{PROJECTS}/{slug}/.env'
+    if os.path.isfile(env):
+        cmd += ['--env-file', env]
+    sh(*cmd, name)
+    for host in hosts:
+        print(f'  persisting {host}')
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=3).close()
+        except urllib.error.HTTPError:
+            pass  # any HTTP answer, even a 404, means it's serving
+        except OSError:
+            time.sleep(0.5)
+            continue
+        return print(f'{name} is up on 127.0.0.1:{port}')
+    logs = sh('docker', 'logs', '--tail', '40', name, check=False)
+    die(f'{name} never answered on :{port}; last logs:\n{logs.stdout}{logs.stderr}')
+
+
+def docker_down(slug):
+    sh('docker', 'rm', '-f', container(slug), check=False)
+    sh('docker', 'rmi', container(slug), check=False)
+
+
+def route(p):
+    s = p['slug']
+    lines = [f'# {p["name"]} ({p["type"]}), generated by `aislop rebuild`: edits here get overwritten',
+             f'redir /{s} /{s}/ 308']
+    for a in p.get('aliases', []):
+        lines += [f'redir /{a} /{s}/ 308', f'redir /{a}/* /{s}/ 308']
+    lines += [f'handle /{s}/* {{', f'\turi strip_prefix /{s}']
+    if p['type'] == 'static':
+        lines += [f'\troot * {PROJECTS}/{s}/public', '\tfile_server {', '\t\thide .*', '\t}']
+    else:
+        lines += [f'\treverse_proxy 127.0.0.1:{p["port"]}']
+    return '\n'.join(lines + ['}', ''])
+
+
+def reload_caddy(prev):
+    mounts = sh('docker', 'inspect', 'caddy', '--format', '{{range .Mounts}}{{.Destination}} {{end}}', check=False)
+    if ROOT not in mounts.stdout.split():
+        print('warning: the caddy container is not serving /srv/aislop yet; run /srv/aislop/setup.sh', file=sys.stderr)
+        return
+    conf = ('--config', CADDYFILE, '--adapter', 'caddyfile')
+    bad = sh('docker', 'exec', 'caddy', 'caddy', 'validate', *conf, check=False)
+    if bad.returncode:
+        if os.path.isdir(prev):
+            shutil.rmtree(ROUTES)
+            os.rename(prev, ROUTES)
+        die(f'generated Caddy config is invalid, kept the previous routes:\n{bad.stderr.strip()[-3000:]}')
+    sh('docker', 'exec', 'caddy', 'caddy', 'reload', *conf)
+
+
+def rebuild(reload=True):
+    projects = load_projects()
+    new, prev = ROUTES + '.new', ROUTES + '.prev'
+    shutil.rmtree(new, ignore_errors=True)
+    os.makedirs(new)
+    for p in projects:
+        with open(f'{new}/{p["slug"]}.caddy', 'w') as f:
+            f.write(route(p))
+    shutil.rmtree(prev, ignore_errors=True)
+    if os.path.isdir(ROUTES):
+        os.rename(ROUTES, prev)
+    os.rename(new, ROUTES)
+    if reload:
+        reload_caddy(prev)
+    listed = sorted((p for p in projects if not p.get('hidden')), key=lambda p: p['name'].lower())
+    listed.sort(key=lambda p: p.get('created', ''), reverse=True)  # newest first, stable by name
+    write_json(f'{ROOT}/www/projects.json',
+               {'updated': now(), 'projects': [{k: p[k] for k in PUBLIC_FIELDS if k in p} for p in listed]})
+
+
+def cmd_deploy():
+    os.makedirs(f'{ROOT}/tmp', exist_ok=True)
+    stage = tempfile.mkdtemp(dir=f'{ROOT}/tmp')
+    try:
+        with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as tar:
+            tar.extractall(stage, filter='data')
+        if not os.path.isfile(f'{stage}/project.json') or not os.path.isdir(f'{stage}/payload'):
+            die('bundle needs project.json and payload/')
+        m = read_json(f'{stage}/project.json')
+        for k in LOCAL_ONLY:
+            m.pop(k, None)
+        projects = load_projects()
+        old = next((p for p in projects if p['slug'] == m.get('slug')), None)
+        check_manifest(m, [p for p in projects if p is not old])
+        slug = m['slug']
+        pdir = f'{PROJECTS}/{slug}'
+        os.makedirs(pdir, exist_ok=True)
+
+        kind, other = ('public', 'app') if m['type'] == 'static' else ('app', 'public')
+        replace_dir(f'{stage}/payload', f'{pdir}/{kind}')
+        shutil.rmtree(f'{pdir}/{other}', ignore_errors=True)
+
+        thumb = next((f for f in os.listdir(stage)
+                      if f.startswith('thumb.') and os.path.splitext(f)[1].lower() in THUMB_EXTS), None)
+        if thumb:
+            drop_thumbs(slug)
+            ext = os.path.splitext(thumb)[1].lower()
+            shutil.move(f'{stage}/{thumb}', f'{THUMBS}/{slug}{ext}')
+            m['thumb'] = f'thumbs/{slug}{ext}?v={int(time.time())}'
+        elif old and old.get('thumb'):
+            m['thumb'] = old['thumb']
+
+        m['created'] = m.get('created') or (old or {}).get('created') or now()[:10]
+        m['updated'] = now()
+        if m['type'] == 'docker':
+            m['port'] = pick_port(m, old, projects)
+            docker_up(m)
+        elif old and old['type'] == 'docker':
+            docker_down(slug)
+        write_json(f'{pdir}/project.json', m)
+        rebuild()
+        print(f'live at {SITE}/{slug}/' + ('  (hidden: not listed on the landing page)' if m.get('hidden') else ''))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def cmd_list():
+    ps = sh('docker', 'ps', '-a', '--filter', 'label=aislop.slug', '--format', '{{.Names}}\t{{.Status}}', check=False)
+    status = dict(line.split('\t', 1) for line in ps.stdout.splitlines() if '\t' in line)
+    for p in load_projects():
+        s = p['slug']
+        kind = p['type'] + (f':{p["port"]}' if p.get('port') else '')
+        state = status.get(container(s), 'no container') if p['type'] == 'docker' else 'files'
+        updated = p.get('updated', '')[:16].replace('T', ' ')
+        print(f'{s:<22}{kind:<14}{state:<28}{updated}{"  hidden" if p.get("hidden") else ""}')
+
+
+def cmd_remove(p):
+    slug = p['slug']
+    docker_down(slug)
+    shutil.rmtree(f'{PROJECTS}/{slug}')
+    drop_thumbs(slug)
+    rebuild()
+    print(f'removed {slug}')
+
+
+def main():
+    args = sys.argv[1:]
+    cmd, rest = (args[0], args[1:]) if args else ('help', [])
+    if cmd == 'deploy':
+        cmd_deploy()
+    elif cmd == 'list':
+        cmd_list()
+    elif cmd == 'rebuild':
+        rebuild(reload='--no-reload' not in rest)
+    elif cmd in ('logs', 'up', 'remove') and rest:
+        p = load_project(rest[0])
+        if cmd == 'remove':
+            cmd_remove(p)
+        elif p['type'] != 'docker':
+            die(f'{p["slug"]} is a static project, so it has no container')
+        elif cmd == 'up':
+            docker_up(p)
+        else:
+            os.execvp('docker', ['docker', 'logs', '--tail', '200', *rest[1:], container(p['slug'])])
+    else:
+        print(__doc__.strip())
+        sys.exit(cmd not in ('help', '-h', '--help'))
+
+
+if __name__ == '__main__':
+    main()
