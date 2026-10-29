@@ -553,7 +553,7 @@ Promise.all([getJSON('projects.json'), getJSON('meta.json').catch(() => ({}))])
   .then(([{ projects, updated }, meta]) => {
     MODELS = meta.models || {};
     const all = projects.map((p) => ({ ...(meta.projects?.[p.slug] || {}), ...p,
-      thumb: p.thumb || meta.projects?.[p.slug]?.shot,
+      thumb: meta.projects?.[p.slug]?.shot || p.thumb, // a shot in www/shots/ replaces a stale deploy-time thumb without redeploying the project
       models: p.models || meta.projects?.[p.slug]?.models,
       repo: p.repo || meta.projects?.[p.slug]?.repo }));
     const [first, ...rest] = all;
